@@ -7,9 +7,11 @@ from rclpy.node import Node
 
 from builtin_interfaces.msg import Time
 from geometry_msgs.msg import PoseStamped, Twist
+from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import BatteryState, Image, Imu, JointState, Range
 from std_msgs.msg import Bool, Float32, String
+from tf2_ros import TransformBroadcaster
 
 try:
     import anki_vector
@@ -39,8 +41,10 @@ class VectorRos2Driver(Node):
         self.declare_parameter("enable_audio_feed", False)
         self.declare_parameter("frame_odom", "odom")
         self.declare_parameter("frame_base", "base_link")
+        self.declare_parameter("frame_footprint", "base_footprint")
         self.declare_parameter("wheel_track_mm", 50.0)
         self.declare_parameter("max_wheel_speed_mmps", 200.0)
+        self.declare_parameter("publish_tf", True)
         self.declare_parameter("joint_head_name", "base_to_head")
         self.declare_parameter("joint_lift_name", "base_to_lift")
         self.declare_parameter("lift_use_angle", True)
@@ -65,6 +69,7 @@ class VectorRos2Driver(Node):
         self._last_cmd_time = None
         self._last_image_id = None
         self._warned_lift_angle = False
+        self._tf_broadcaster = TransformBroadcaster(self)
 
         self._setup_publishers()
         self._setup_subscribers()
@@ -79,6 +84,7 @@ class VectorRos2Driver(Node):
         self.pub_range = self.create_publisher(Range, "proximity/range", 10)
         self.pub_touch = self.create_publisher(Bool, "touch", 10)
         self.pub_touch_raw = self.create_publisher(Float32, "touch/raw", 10)
+        self.pub_cliff = self.create_publisher(Bool, "cliff_detected", 10)
         self.pub_joint = self.create_publisher(JointState, "joint_states", 10)
         self.pub_head_angle = self.create_publisher(Float32, "head_angle", 10)
         self.pub_lift_height = self.create_publisher(Float32, "lift_height", 10)
@@ -175,10 +181,15 @@ class VectorRos2Driver(Node):
             lift_angle = getattr(self._robot, "lift_angle_rad", None)
             touch = self._robot.touch.last_sensor_reading
             proximity = self._robot.proximity.last_sensor_reading
+            status = getattr(self._robot, "status", None)
 
         stamp = self._stamp()
         frame_odom = self.get_parameter("frame_odom").get_parameter_value().string_value
         frame_base = self.get_parameter("frame_base").get_parameter_value().string_value
+        frame_footprint = (
+            self.get_parameter("frame_footprint").get_parameter_value().string_value
+        )
+        publish_tf = self.get_parameter("publish_tf").get_parameter_value().bool_value
 
         if pose is not None:
             pose_msg = PoseStamped()
@@ -196,9 +207,20 @@ class VectorRos2Driver(Node):
 
             odom = Odometry()
             odom.header = pose_msg.header
-            odom.child_frame_id = frame_base
+            odom.child_frame_id = frame_footprint
             odom.pose.pose = pose_msg.pose
             self.pub_odom.publish(odom)
+
+            if publish_tf:
+                tf_msg = TransformStamped()
+                tf_msg.header.stamp = stamp
+                tf_msg.header.frame_id = frame_odom
+                tf_msg.child_frame_id = frame_footprint
+                tf_msg.transform.translation.x = pose_msg.pose.position.x
+                tf_msg.transform.translation.y = pose_msg.pose.position.y
+                tf_msg.transform.translation.z = pose_msg.pose.position.z
+                tf_msg.transform.rotation = pose_msg.pose.orientation
+                self._tf_broadcaster.sendTransform(tf_msg)
 
         imu_msg = Imu()
         imu_msg.header.stamp = stamp
@@ -243,6 +265,11 @@ class VectorRos2Driver(Node):
             touch_raw = Float32()
             touch_raw.data = float(getattr(touch, "raw_touch_value", 0.0))
             self.pub_touch_raw.publish(touch_raw)
+
+        if status is not None:
+            cliff_msg = Bool()
+            cliff_msg.data = bool(getattr(status, "is_cliff_detected", False))
+            self.pub_cliff.publish(cliff_msg)
 
         joint = JointState()
         joint.header.stamp = stamp

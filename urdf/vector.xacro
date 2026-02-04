@@ -1,0 +1,86 @@
+<?xml version="1.0"?>
+<robot name="vector" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <!-- Inertia util -->
+  <xacro:include filename="$(find vector_ros2)/urdf/inertia.xacro"/>
+
+  <link name="base_footprint"/>
+
+  <joint name="base_footprint_joint" type="fixed">
+    <origin rpy="0 0 0" xyz="0 0 0.027"/>
+    <parent link="base_footprint"/>
+    <child link="base_link"/>
+  </joint>
+
+  <!-- Body -->
+  <link name="base_link">
+    <visual>
+      <geometry>
+        <mesh filename="package://vector_ros2/meshes/vector_body.dae"  />
+      </geometry>
+    </visual>
+    <collision>
+      <origin rpy="0 0 0" xyz="0.0075 0.0 -0.01"/>
+      <geometry>
+        <box size="0.07 0.03 0.01"/>
+        <!-- <mesh filename="package://vector_ros2/meshes/vector_body.dae"  /> -->
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.0075 0.0 -0.01"/>
+      <geometry>
+        <box size="0.073 0.043 0.061"/>
+      </geometry>
+      <mass value="0.16"/>
+      <xacro:box_inertia m="0.16" x="0.073" y="0.043" z="0.061" />
+    </inertial>
+  </link>
+  <!-- Head -->
+  <link name="head">
+    <visual>
+      <geometry>
+        <mesh filename="package://vector_ros2/meshes/vector_head.dae" />
+      </geometry>
+    </visual>
+    <collision>
+      <geometry>
+        <sphere radius="0.02"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <geometry>
+        <sphere radius="0.02"/>
+      </geometry>
+      <mass value="0.03"/>
+      <xacro:sphere_inertia m="0.03" r="0.02" />
+    </inertial>
+  </link>
+  <!-- lifter -->
+  <link name="full_lift">
+    <visual>
+      <geometry>
+        <mesh filename="package://vector_ros2/meshes/vector_lift.dae"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin rpy="0 0 0" xyz="0.062 0.0 -0.015"/>
+      <geometry>
+        <box size="0.0075 0.05 0.025"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.062 0.0 -0.015"/>
+      <mass value="0.05"/>
+      <xacro:box_inertia m="0.05" x="0.0075" y="0.05" z="0.025"/>
+    </inertial>
+  </link>
+  <!-- components -->
+  <xacro:include filename="$(find vector_ros2)/urdf/joints.xacro"/>
+  <xacro:include filename="$(find vector_ros2)/urdf/base.xacro"/>
+  <xacro:include filename="$(find vector_ros2)/urdf/vector_cam.xacro"/>
+  <xacro:include filename="$(find vector_ros2)/urdf/vector_drop.xacro"/>
+  <xacro:include filename="$(find vector_ros2)/urdf/laser.xacro"/>
+  <xacro:include filename="$(find vector_ros2)/urdf/imu.xacro"/>
+  <xacro:imu ankirobot="vector"/>
+
+</robot>

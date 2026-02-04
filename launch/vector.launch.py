@@ -2,25 +2,55 @@ import os
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, SetEnvironmentVariable
-from launch.substitutions import EnvironmentVariable, LaunchConfiguration, TextSubstitution
+from launch.conditions import IfCondition
+from launch.substitutions import (
+    EnvironmentVariable,
+    LaunchConfiguration,
+    TextSubstitution,
+    Command,
+    PathJoinSubstitution,
+)
+from launch.substitutions import FindExecutable
 from launch_ros.actions import Node
+from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description():
     venv_site_packages = LaunchConfiguration("venv_site_packages")
+    use_robot_state_publisher = LaunchConfiguration("use_robot_state_publisher")
+    model = LaunchConfiguration("model")
     default_venv = os.environ.get("VECTOR_VENV_SITE_PACKAGES", "")
     if not default_venv:
         default_venv = "/home/nils/vector_ws/.vector/lib/python3.12/site-packages"
+    default_model = PathJoinSubstitution(
+        [FindPackageShare("vector_ros2"), "urdf", "vector.xacro"]
+    )
 
     return LaunchDescription(
         [
             DeclareLaunchArgument("venv_site_packages", default_value=default_venv),
+            DeclareLaunchArgument("use_robot_state_publisher", default_value="true"),
+            DeclareLaunchArgument("model", default_value=default_model),
             SetEnvironmentVariable(
                 name="PYTHONPATH",
                 value=[
                     EnvironmentVariable("PYTHONPATH", default_value=""),
                     TextSubstitution(text=":"),
                     venv_site_packages,
+                ],
+            ),
+            Node(
+                package="robot_state_publisher",
+                executable="robot_state_publisher",
+                name="robot_state_publisher",
+                output="screen",
+                condition=IfCondition(use_robot_state_publisher),
+                parameters=[
+                    {
+                        "robot_description": Command(
+                            [FindExecutable(name="xacro"), " ", model]
+                        )
+                    }
                 ],
             ),
             Node(
@@ -43,8 +73,10 @@ def generate_launch_description():
                         "enable_audio_feed": False,
                         "frame_odom": "odom",
                         "frame_base": "base_link",
+                        "frame_footprint": "base_footprint",
                         "wheel_track_mm": 50.0,
                         "max_wheel_speed_mmps": 200.0,
+                        "publish_tf": True,
                         "joint_head_name": "base_to_head",
                         "joint_lift_name": "base_to_lift",
                         "lift_use_angle": True,

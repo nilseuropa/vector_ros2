@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+<xacro:macro name="imu" params="ankirobot">
+  <link name="imu"/>
+
+  <joint name="imu_joint" type="fixed">
+    <parent link="head"/>
+    <child link="imu"/>
+    <origin xyz="0.0 0 0.0" rpy="0 0 0" />
+  </joint>
+
+</xacro:macro>
+
+</robot>

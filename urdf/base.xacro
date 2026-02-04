@@ -1,0 +1,82 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <material name="black">
+    <color rgba="0.05 0.05 0.05 1.0"/>
+  </material>
+
+  <xacro:macro name="wheel" params="link_name *origin radius">
+    <link name="${link_name}">
+      <visual>
+        <material name="black"/>
+        <origin rpy="0 0 0" xyz="0 0 0"/>
+        <geometry>
+          <cylinder radius="${radius}" length="0.0116739"/>
+        </geometry>
+      </visual>
+      <collision>
+        <material name="black"/>
+        <origin rpy="0 0 0" xyz="0 0 0"/>
+        <geometry>
+            <cylinder radius="${radius}" length="0.0116739"/>
+        </geometry>
+      </collision>
+      <inertial>
+        <origin rpy="0 0 0" xyz="0 0 0"/>
+        <geometry>
+          <cylinder radius="${radius}" length="0.0116739"/>
+        </geometry>
+        <mass value="0.01"/>
+        <xacro:cylinder_inertia m="0.01" r="${radius}" h="0.01167"/>
+      </inertial>
+    </link>
+    <joint name="${link_name}_joint" type="fixed">
+        <parent link="base_link"/>
+        <child link="${link_name}"/>
+        <xacro:insert_block name="origin"/>
+        <axis xyz="0 0 1"/>
+    </joint>
+  </xacro:macro>
+
+<xacro:wheel link_name="front_left_wheel" radius="0.01314">
+  <origin xyz="0.03 0.024 -0.012" rpy="${-pi/2} 0 0"/>
+</xacro:wheel>
+
+<xacro:wheel link_name="front_right_wheel" radius="0.01314">
+  <origin xyz="0.03 -0.024 -0.012" rpy="${-pi/2} 0 0"/>
+</xacro:wheel>
+
+<xacro:wheel link_name="rear_left_wheel" radius="0.008995">
+  <origin xyz="-0.017 0.024 -0.0151707" rpy="${-pi/2} 0 0"/>
+</xacro:wheel>
+
+<xacro:wheel link_name="rear_right_wheel" radius="0.008995">
+  <origin xyz="-0.017 -0.024 -0.0151707" rpy="${-pi/2} 0 0"/>
+</xacro:wheel>
+
+<link name="left_belt">
+  <visual>
+    <geometry>
+      <mesh filename="package://vector_ros2/meshes/cozmo_belt.dae" />
+    </geometry>
+  </visual>
+</link>
+<joint name="wheel_left_belt" type="fixed">
+  <parent link="base_link"/>
+  <child link="left_belt"/>
+  <origin xyz="0.00945088 0.024 -0.0133211"/>
+</joint>
+
+<link name="right_belt">
+  <visual>
+    <geometry>
+      <mesh filename="package://vector_ros2/meshes/cozmo_belt.dae" />
+    </geometry>
+  </visual>
+</link>
+<joint name="wheel_right_belt" type="fixed">
+  <parent link="base_link"/>
+  <child link="right_belt"/>
+  <origin xyz="0.00945088 -0.024 -0.0133211"/>
+</joint>
+
+</robot>

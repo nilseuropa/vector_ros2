@@ -12,6 +12,7 @@ Publishes:
 - `proximity/range` (sensor_msgs/Range)
 - `touch` (std_msgs/Bool)
 - `touch/raw` (std_msgs/Float32)
+- `cliff_detected` (std_msgs/Bool)
 - `joint_states` (sensor_msgs/JointState) for head and lift (URDF joint names)
 - `head_angle` (std_msgs/Float32)
 - `lift_height` (std_msgs/Float32)
@@ -50,7 +51,7 @@ python3 -m anki_vector.configure
 4) Build the ROS 2 package:
 
 ```bash
-cd /home/nils/Vector
+cd /home/nils/vector_ws
 colcon build --packages-select vector_ros2
 source install/setup.bash
 ```
@@ -72,6 +73,8 @@ ros2 launch vector_ros2 vector.launch.py
 - If you use a venv for the SDK, set `venv_site_packages` in the launch file or export
   `VECTOR_VENV_SITE_PACKAGES` to point at the venv site-packages. The launch file
   appends this to `PYTHONPATH` so ROS 2 can still find the package metadata.
+- The Vector URDF/xacro and meshes are included in this package and launched with
+  `robot_state_publisher` by default.
 
 ## Parameters
 
@@ -88,8 +91,12 @@ ros2 launch vector_ros2 vector.launch.py
 - `enable_audio_feed` (bool)
 - `frame_odom` (string)
 - `frame_base` (string)
+- `frame_footprint` (string): child frame for odom/TF (default `base_footprint`)
 - `wheel_track_mm` (float)
 - `max_wheel_speed_mmps` (float)
+- `publish_tf` (bool): publish `odom` → `base_link` transform
+- `use_robot_state_publisher` (bool): launch `robot_state_publisher` (default true)
+- `model` (string): path to the xacro model (default vector_ros2/urdf/vector.xacro)
 - `joint_head_name` (string): URDF joint for head (default `base_to_head`)
 - `joint_lift_name` (string): URDF joint for lift (default `base_to_lift`)
 - `lift_use_angle` (bool): use SDK `lift_angle_rad` if available
