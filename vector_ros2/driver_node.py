@@ -168,56 +168,20 @@ class VectorRos2Driver(Node):
         # SDK uses q0 as w.
         return q0, q1, q2, q3
 
-
-    def _has_subscribers(self, publisher):
-        return publisher.get_subscription_count() > 0
-
     def _publish_state(self):
         if self._robot is None:
             return
-        if not self._robot_lock.acquire(blocking=False):
-            return
 
-        publish_tf = self.get_parameter("publish_tf").get_parameter_value().bool_value
-        need_imu = self._has_subscribers(self.pub_imu)
-        need_pose = (
-            publish_tf
-            or need_imu
-            or self._has_subscribers(self.pub_pose)
-            or self._has_subscribers(self.pub_odom)
-        )
-        need_proximity = self._has_subscribers(self.pub_range)
-        need_touch = self._has_subscribers(self.pub_touch) or self._has_subscribers(
-            self.pub_touch_raw
-        )
-        need_status = self._has_subscribers(self.pub_cliff)
-        need_joint = True
-        need_head_angle = need_joint or self._has_subscribers(self.pub_head_angle)
-        need_lift = need_joint or self._has_subscribers(self.pub_lift_height)
-        lift_use_angle = self.get_parameter("lift_use_angle").get_parameter_value().bool_value
-
-        try:
-            pose = self._robot.pose if need_pose else None
-            accel = self._robot.accel if need_imu else None
-            gyro = self._robot.gyro if need_imu else None
-            head_angle = (
-                getattr(self._robot, "head_angle_rad", None) if need_head_angle else None
-            )
-            lift_height = (
-                getattr(self._robot, "lift_height_mm", None) if need_lift else None
-            )
-            lift_angle = (
-                getattr(self._robot, "lift_angle_rad", None)
-                if need_joint and lift_use_angle
-                else None
-            )
-            touch = self._robot.touch.last_sensor_reading if need_touch else None
-            proximity = (
-                self._robot.proximity.last_sensor_reading if need_proximity else None
-            )
-            status = getattr(self._robot, "status", None) if need_status else None
-        finally:
-            self._robot_lock.release()
+        with self._robot_lock:
+            pose = self._robot.pose
+            accel = self._robot.accel
+            gyro = self._robot.gyro
+            head_angle = getattr(self._robot, "head_angle_rad", None)
+            lift_height = getattr(self._robot, "lift_height_mm", None)
+            lift_angle = getattr(self._robot, "lift_angle_rad", None)
+            touch = self._robot.touch.last_sensor_reading
+            proximity = self._robot.proximity.last_sensor_reading
+            status = getattr(self._robot, "status", None)
 
         stamp = self._stamp()
         frame_odom = self.get_parameter("frame_odom").get_parameter_value().string_value
@@ -225,27 +189,27 @@ class VectorRos2Driver(Node):
         frame_footprint = (
             self.get_parameter("frame_footprint").get_parameter_value().string_value
         )
-        if pose is not None and need_pose:
+        publish_tf = self.get_parameter("publish_tf").get_parameter_value().bool_value
+
+        if pose is not None:
             pose_msg = PoseStamped()
             pose_msg.header.stamp = stamp
             pose_msg.header.frame_id = frame_odom
-            q0, q1, q2, q3 = self._get_pose_quat(pose)
             pose_msg.pose.position.x = pose.position.x / 1000.0
             pose_msg.pose.position.y = pose.position.y / 1000.0
             pose_msg.pose.position.z = pose.position.z / 1000.0
+            q0, q1, q2, q3 = self._get_pose_quat(pose)
             pose_msg.pose.orientation.w = q0
             pose_msg.pose.orientation.x = q1
             pose_msg.pose.orientation.y = q2
             pose_msg.pose.orientation.z = q3
-            if self._has_subscribers(self.pub_pose):
-                self.pub_pose.publish(pose_msg)
+            self.pub_pose.publish(pose_msg)
 
-            if self._has_subscribers(self.pub_odom):
-                odom = Odometry()
-                odom.header = pose_msg.header
-                odom.child_frame_id = frame_footprint
-                odom.pose.pose = pose_msg.pose
-                self.pub_odom.publish(odom)
+            odom = Odometry()
+            odom.header = pose_msg.header
+            odom.child_frame_id = frame_footprint
+            odom.pose.pose = pose_msg.pose
+            self.pub_odom.publish(odom)
 
             if publish_tf:
                 tf_msg = TransformStamped()
@@ -258,37 +222,28 @@ class VectorRos2Driver(Node):
                 tf_msg.transform.rotation = pose_msg.pose.orientation
                 self._tf_broadcaster.sendTransform(tf_msg)
 
-        if need_imu:
-            imu_msg = Imu()
-            imu_msg.header.stamp = stamp
-            imu_msg.header.frame_id = frame_base
-            if pose is not None:
-                q0, q1, q2, q3 = self._get_pose_quat(pose)
-                imu_msg.orientation.w = q0
-                imu_msg.orientation.x = q1
-                imu_msg.orientation.y = q2
-                imu_msg.orientation.z = q3
-            accel_scale = (
-                self.get_parameter("imu_accel_scale")
-                .get_parameter_value()
-                .double_value
-            )
-            gyro_scale = (
-                self.get_parameter("imu_gyro_scale")
-                .get_parameter_value()
-                .double_value
-            )
-            if accel is not None:
-                imu_msg.linear_acceleration.x = float(accel.x) * accel_scale
-                imu_msg.linear_acceleration.y = float(accel.y) * accel_scale
-                imu_msg.linear_acceleration.z = float(accel.z) * accel_scale
-            if gyro is not None:
-                imu_msg.angular_velocity.x = float(gyro.x) * gyro_scale
-                imu_msg.angular_velocity.y = float(gyro.y) * gyro_scale
-                imu_msg.angular_velocity.z = float(gyro.z) * gyro_scale
-            self.pub_imu.publish(imu_msg)
+        imu_msg = Imu()
+        imu_msg.header.stamp = stamp
+        imu_msg.header.frame_id = frame_base
+        if pose is not None:
+            q0, q1, q2, q3 = self._get_pose_quat(pose)
+            imu_msg.orientation.w = q0
+            imu_msg.orientation.x = q1
+            imu_msg.orientation.y = q2
+            imu_msg.orientation.z = q3
+        accel_scale = self.get_parameter("imu_accel_scale").get_parameter_value().double_value
+        gyro_scale = self.get_parameter("imu_gyro_scale").get_parameter_value().double_value
+        if accel is not None:
+            imu_msg.linear_acceleration.x = float(accel.x) * accel_scale
+            imu_msg.linear_acceleration.y = float(accel.y) * accel_scale
+            imu_msg.linear_acceleration.z = float(accel.z) * accel_scale
+        if gyro is not None:
+            imu_msg.angular_velocity.x = float(gyro.x) * gyro_scale
+            imu_msg.angular_velocity.y = float(gyro.y) * gyro_scale
+            imu_msg.angular_velocity.z = float(gyro.z) * gyro_scale
+        self.pub_imu.publish(imu_msg)
 
-        if need_proximity and proximity is not None:
+        if proximity is not None:
             range_msg = Range()
             range_msg.header.stamp = stamp
             range_msg.header.frame_id = frame_base
@@ -302,18 +257,16 @@ class VectorRos2Driver(Node):
                     range_msg.range = dist_mm / 1000.0
             self.pub_range.publish(range_msg)
 
-        if need_touch and touch is not None:
+        if touch is not None:
             touch_msg = Bool()
             touch_msg.data = bool(getattr(touch, "is_being_touched", False))
-            if self._has_subscribers(self.pub_touch):
-                self.pub_touch.publish(touch_msg)
+            self.pub_touch.publish(touch_msg)
 
             touch_raw = Float32()
             touch_raw.data = float(getattr(touch, "raw_touch_value", 0.0))
-            if self._has_subscribers(self.pub_touch_raw):
-                self.pub_touch_raw.publish(touch_raw)
+            self.pub_touch_raw.publish(touch_raw)
 
-        if need_status and status is not None:
+        if status is not None:
             cliff_msg = Bool()
             cliff_msg.data = bool(getattr(status, "is_cliff_detected", False))
             self.pub_cliff.publish(cliff_msg)
@@ -331,6 +284,7 @@ class VectorRos2Driver(Node):
         if head_angle is not None:
             head_pos = float(head_angle) * head_scale + head_offset
         lift_pos = 0.0
+        lift_use_angle = self.get_parameter("lift_use_angle").get_parameter_value().bool_value
         if lift_use_angle and lift_angle is not None:
             lift_pos = float(lift_angle)
         elif lift_height is not None:
@@ -354,11 +308,11 @@ class VectorRos2Driver(Node):
         joint.position = [head_pos, lift_pos]
         self.pub_joint.publish(joint)
 
-        if head_angle is not None and self._has_subscribers(self.pub_head_angle):
+        if head_angle is not None:
             head_msg = Float32()
             head_msg.data = float(head_angle)
             self.pub_head_angle.publish(head_msg)
-        if lift_height is not None and self._has_subscribers(self.pub_lift_height):
+        if lift_height is not None:
             lift_msg = Float32()
             lift_msg.data = float(lift_height) / 1000.0
             self.pub_lift_height.publish(lift_msg)
@@ -368,16 +322,11 @@ class VectorRos2Driver(Node):
     def _publish_battery(self):
         if self._robot is None:
             return
-        if not self._has_subscribers(self.pub_battery):
-            return
-        if not self._robot_lock.acquire(blocking=False):
-            return
-        try:
-            batt = self._robot.get_battery_state()
-        except Exception:
-            return
-        finally:
-            self._robot_lock.release()
+        with self._robot_lock:
+            try:
+                batt = self._robot.get_battery_state()
+            except Exception:
+                return
         msg = BatteryState()
         msg.header.stamp = self._stamp()
         msg.power_supply_status = BatteryState.POWER_SUPPLY_STATUS_UNKNOWN
@@ -398,14 +347,8 @@ class VectorRos2Driver(Node):
             return
         if not self.get_parameter("enable_camera").get_parameter_value().bool_value:
             return
-        if not self._has_subscribers(self.pub_image):
-            return
-        if not self._robot_lock.acquire(blocking=False):
-            return
-        try:
+        with self._robot_lock:
             image = self._robot.camera.latest_image
-        finally:
-            self._robot_lock.release()
         if image is None:
             return
         image_id = getattr(image, "image_id", None)
