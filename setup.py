@@ -9,6 +9,7 @@ setup(
     data_files=[
         ("share/ament_index/resource_index/packages", [f"resource/{package_name}"]),
         (f"share/{package_name}", ["package.xml"]),
+        (f"share/{package_name}/srv", ["srv/PlayAnimationTrigger.srv"]),
         (f"share/{package_name}/launch", ["launch/vector.launch.py"]),
         (f"share/{package_name}/urdf", [
             "urdf/base.xacro",

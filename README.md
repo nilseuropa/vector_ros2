@@ -23,8 +23,13 @@ Subscribes:
 - `head_angle_cmd` (std_msgs/Float32)
 - `lift_height_cmd` (std_msgs/Float32)
 - `say_text` (std_msgs/String)
-- `play_animation_trigger` (std_msgs/String)
-- `drive_charger` (std_msgs/Bool)
+
+Services:
+- `start_exploration` (std_srvs/Trigger)
+- `fetch_cube` (std_srvs/Trigger)
+- `go_home` (std_srvs/Trigger)
+- `drive_off_charger` (std_srvs/Trigger)
+- `play_animation` (vector_ros2/srv/PlayAnimationTrigger)
 
 ## Setup
 
@@ -108,6 +113,26 @@ ros2 launch vector_ros2 vector.launch.py
 - `imu_gyro_scale` (float): multiply gyro values from SDK (default 1.0)
 - `head_angle_scale` (float): scale head angle from SDK before publishing joint state
 - `head_angle_offset` (float): offset head angle (radians) before publishing joint state
+
+## Services
+
+`play_animation` expects an animation trigger name:
+
+```bash
+ros2 service call /play_animation vector_ros2/srv/PlayAnimationTrigger "{name: GreetAfterLongTime}"
+```
+
+List available animation triggers via the SDK:
+
+```bash
+python - <<'PY'
+import anki_vector
+
+with anki_vector.Robot() as robot:
+    for name in robot.anim.anim_trigger_list:
+        print(name)
+PY
+```
 
 ## Next steps
 

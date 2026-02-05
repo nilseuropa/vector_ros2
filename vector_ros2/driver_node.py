@@ -1,6 +1,6 @@
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 
 import rclpy
 from rclpy.node import Node
@@ -11,14 +11,18 @@ from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import BatteryState, Image, Imu, JointState, Range
 from std_msgs.msg import Bool, Float32, String
+from std_srvs.srv import Trigger
 from tf2_ros import TransformBroadcaster
 
+from vector_ros2.srv import PlayAnimationTrigger
 try:
     import anki_vector
     from anki_vector import util
+    from anki_vector.messaging import protocol
 except Exception as exc:  # pragma: no cover - import guard for runtime
     anki_vector = None
     util = None
+    protocol = None
     _import_error = exc
 else:
     _import_error = None
@@ -73,10 +77,12 @@ class VectorRos2Driver(Node):
         self._state_inflight = False
         self._battery_inflight = False
         self._camera_inflight = False
+        self._services = []
 
         self._setup_publishers()
         self._setup_subscribers()
         self._connect_robot()
+        self._setup_services()
         self._setup_timers()
 
     def _setup_publishers(self):
@@ -98,8 +104,6 @@ class VectorRos2Driver(Node):
         self.create_subscription(Float32, "head_angle_cmd", self._on_head_angle, 10)
         self.create_subscription(Float32, "lift_height_cmd", self._on_lift_height, 10)
         self.create_subscription(String, "say_text", self._on_say_text, 10)
-        self.create_subscription(String, "play_animation_trigger", self._on_animation, 10)
-        self.create_subscription(Bool, "drive_charger", self._on_drive_charger, 10)
 
     def _connect_robot(self):
         serial = self.get_parameter("serial").get_parameter_value().string_value.strip()
@@ -139,6 +143,93 @@ class VectorRos2Driver(Node):
 
         if enable_camera:
             self._robot.camera.init_camera_feed()
+
+    def _setup_services(self):
+        self._services = [
+            self.create_service(
+                Trigger, "start_exploration", self._srv_start_exploration
+            ),
+            self.create_service(Trigger, "fetch_cube", self._srv_fetch_cube),
+            self.create_service(Trigger, "go_home", self._srv_go_home),
+            self.create_service(
+                PlayAnimationTrigger, "play_animation", self._srv_play_animation_trigger
+            ),
+            self.create_service(
+                Trigger, "drive_off_charger", self._srv_drive_off_charger
+            ),
+        ]
+
+    def _srv_call(self, label, func):
+        response = Trigger.Response()
+        if self._robot is None:
+            response.success = False
+            response.message = f"{label}: robot not connected"
+            return response
+        try:
+            func()
+        except Exception as exc:
+            response.success = False
+            response.message = f"{label}: {exc}"
+            return response
+        response.success = True
+        response.message = f"{label}: ok"
+        return response
+
+    def _srv_start_exploration(self, _request, _context):
+        return self._srv_call(
+            "start_exploration",
+            lambda: self._sdk_call(self._robot.behavior.look_around_in_place),
+        )
+
+    def _srv_fetch_cube(self, _request, _context):
+        def _run():
+            cube = self._sdk_call(lambda: self._robot.world.connected_light_cube)
+            if cube is None:
+                self._sdk_call(self._robot.world.connect_cube)
+                cube = self._sdk_call(lambda: self._robot.world.connected_light_cube)
+            if cube is None:
+                raise RuntimeError("No cube connected")
+            self._sdk_call(self._robot.behavior.pickup_object, cube)
+
+        return self._srv_call("fetch_cube", _run)
+
+    def _srv_go_home(self, _request, _context):
+        return self._srv_call(
+            "go_home",
+            lambda: self._sdk_call(self._robot.behavior.drive_on_charger),
+        )
+
+    def _srv_drive_off_charger(self, _request, _context):
+        return self._srv_call(
+            "drive_off_charger",
+            lambda: self._sdk_call(self._robot.behavior.drive_off_charger),
+        )
+
+    def _srv_play_animation_trigger(self, request, _context):
+        trigger = request.name.strip()
+        response = PlayAnimationTrigger.Response()
+        if not trigger:
+            response.success = False
+            response.message = "play_animation: name is required"
+            return response
+        if self._robot is None:
+            response.success = False
+            response.message = "play_animation: robot not connected"
+            return response
+        try:
+            if protocol is not None and hasattr(protocol, "AnimationTrigger"):
+                anim_trigger = protocol.AnimationTrigger(name=trigger)
+                self._sdk_call(self._robot.anim.play_animation_trigger, anim_trigger)
+            else:
+                self._sdk_call(self._robot.anim.play_animation_trigger, trigger)
+        except Exception as exc:
+            response.success = False
+            response.message = f"play_animation: {exc}"
+            return response
+        response.success = True
+        response.message = "play_animation: ok"
+        return response
+
 
     def _setup_timers(self):
         state_hz = self.get_parameter("state_hz").get_parameter_value().double_value
@@ -527,30 +618,10 @@ class VectorRos2Driver(Node):
         except Exception:
             pass
 
-    def _on_animation(self, msg: String):
-        if self._robot is None:
-            return
-        trigger = msg.data.strip()
-        if not trigger:
-            return
-        try:
-            self._sdk_call(self._robot.anim.play_animation_trigger, trigger)
-        except Exception:
-            pass
-
-    def _on_drive_charger(self, msg: Bool):
-        if self._robot is None:
-            return
-        try:
-            if msg.data:
-                self._sdk_call(self._robot.behavior.drive_on_charger)
-            else:
-                self._sdk_call(self._robot.behavior.drive_off_charger)
-        except Exception:
-            pass
-
     def destroy_node(self):
         try:
+            for srv in self._services:
+                srv.destroy()
             if self._robot is not None:
                 self._robot.disconnect()
         finally:
