@@ -4,6 +4,17 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 
 import rclpy
 from rclpy.node import Node
+from rclpy.parameter_service import ParameterService
+from rclpy.qos import qos_profile_parameters
+from rcl_interfaces.srv import (
+    DescribeParameters,
+    GetParameters,
+    GetParameterTypes,
+    ListParameters,
+    SetParameters,
+    SetParametersAtomically,
+)
+from rcl_interfaces.msg import SetParametersResult
 
 from builtin_interfaces.msg import Time
 from geometry_msgs.msg import PoseStamped, Twist
@@ -38,6 +49,9 @@ class VectorRos2Driver(Node):
         self.declare_parameter("battery_hz", 1.0)
         self.declare_parameter("camera_hz", 5.0)
         self.declare_parameter("cmd_vel_timeout_sec", 0.5)
+        self.declare_parameter("control_release_timeout_sec", 0.5)
+        self.declare_parameter("behavior_control_level", "override")
+        self.declare_parameter("hold_control_during_cmd_vel", True)
         self.declare_parameter("enable_camera", True)
         self.declare_parameter("enable_face_detection", False)
         self.declare_parameter("enable_nav_map_feed", False)
@@ -77,7 +91,19 @@ class VectorRos2Driver(Node):
         self._state_inflight = False
         self._battery_inflight = False
         self._camera_inflight = False
-        self._services = []
+        self._service_handles = []
+        self._parameter_service = ParameterService(self)
+        self._parameter_service_fallback = []
+        self._ensure_parameter_services()
+        self._control_lock = threading.Lock()
+        self._control_held = False
+        self._control_held_by_cmd_vel = False
+        self._behavior_control_level = None
+
+        self._behavior_control_level = self._parse_behavior_control_level(
+            self.get_parameter("behavior_control_level").get_parameter_value().string_value
+        )
+        self.add_on_set_parameters_callback(self._on_set_parameters)
 
         self._setup_publishers()
         self._setup_subscribers()
@@ -96,6 +122,58 @@ class VectorRos2Driver(Node):
         self.pub_cliff = self.create_publisher(Bool, "cliff_detected", 10)
         self.pub_joint = self.create_publisher(JointState, "joint_states", 10)
         self.pub_image = self.create_publisher(Image, "camera/image_raw", 10)
+
+    def _ensure_parameter_services(self):
+        base = self.get_fully_qualified_name()
+        expected = {
+            f"{base}/describe_parameters",
+            f"{base}/get_parameters",
+            f"{base}/get_parameter_types",
+            f"{base}/list_parameters",
+            f"{base}/set_parameters",
+            f"{base}/set_parameters_atomically",
+        }
+        existing = {name for name, _ in self.get_service_names_and_types()}
+        if expected.intersection(existing):
+            return
+        self._parameter_service_fallback = [
+            self.create_service(
+                DescribeParameters,
+                f"{base}/describe_parameters",
+                self._parameter_service._describe_parameters_callback,
+                qos_profile=qos_profile_parameters,
+            ),
+            self.create_service(
+                GetParameters,
+                f"{base}/get_parameters",
+                self._parameter_service._get_parameters_callback,
+                qos_profile=qos_profile_parameters,
+            ),
+            self.create_service(
+                GetParameterTypes,
+                f"{base}/get_parameter_types",
+                self._parameter_service._get_parameter_types_callback,
+                qos_profile=qos_profile_parameters,
+            ),
+            self.create_service(
+                ListParameters,
+                f"{base}/list_parameters",
+                self._parameter_service._list_parameters_callback,
+                qos_profile=qos_profile_parameters,
+            ),
+            self.create_service(
+                SetParameters,
+                f"{base}/set_parameters",
+                self._parameter_service._set_parameters_callback,
+                qos_profile=qos_profile_parameters,
+            ),
+            self.create_service(
+                SetParametersAtomically,
+                f"{base}/set_parameters_atomically",
+                self._parameter_service._set_parameters_atomically_callback,
+                qos_profile=qos_profile_parameters,
+            ),
+        ]
 
     def _setup_subscribers(self):
         self.create_subscription(Twist, "cmd_vel", self._on_cmd_vel, 10)
@@ -134,6 +212,11 @@ class VectorRos2Driver(Node):
             kwargs["enable_audio_feed"] = True
 
         self.get_logger().info("Connecting to Vector...")
+        behavior_control_level = self._behavior_control_level
+        if behavior_control_level is not None:
+            kwargs["behavior_control_level"] = behavior_control_level
+        else:
+            kwargs["behavior_control_level"] = None
         self._robot = anki_vector.Robot(**kwargs)
         self._robot.connect()
         self.get_logger().info("Vector connected.")
@@ -142,7 +225,7 @@ class VectorRos2Driver(Node):
             self._robot.camera.init_camera_feed()
 
     def _setup_services(self):
-        self._services = [
+        self._service_handles = [
             self.create_service(
                 Trigger, "start_exploration", self._srv_start_exploration
             ),
@@ -164,7 +247,7 @@ class VectorRos2Driver(Node):
             response.message = f"{label}: robot not connected"
             return response
         try:
-            func()
+            self._call_with_control(func)
         except Exception as exc:
             response.success = False
             response.message = f"{label}: {exc}"
@@ -217,9 +300,17 @@ class VectorRos2Driver(Node):
         try:
             if protocol is not None and hasattr(protocol, "AnimationTrigger"):
                 anim_trigger = protocol.AnimationTrigger(name=trigger)
-                self._sdk_call(self._robot.anim.play_animation_trigger, anim_trigger)
+                self._call_with_control(
+                    lambda: self._sdk_call(
+                        self._robot.anim.play_animation_trigger, anim_trigger
+                    )
+                )
             else:
-                self._sdk_call(self._robot.anim.play_animation_trigger, trigger)
+                self._call_with_control(
+                    lambda: self._sdk_call(
+                        self._robot.anim.play_animation_trigger, trigger
+                    )
+                )
         except Exception as exc:
             response.success = False
             response.message = f"play_animation: {exc}"
@@ -542,11 +633,24 @@ class VectorRos2Driver(Node):
         if elapsed <= timeout:
             return
         self._last_cmd_time = None
-        self._cmd_executor.submit(self._set_wheel_speeds, 0.0, 0.0)
+        self._cmd_executor.submit(self._set_wheel_speeds, 0.0, 0.0, False)
+        if self._control_held_by_cmd_vel:
+            release_timeout = (
+                self.get_parameter("control_release_timeout_sec")
+                .get_parameter_value()
+                .double_value
+            )
+            if release_timeout <= 0 or elapsed >= release_timeout:
+                self._release_control()
 
     def _on_cmd_vel(self, msg: Twist):
         wheel_track_mm = self.get_parameter("wheel_track_mm").get_parameter_value().double_value
         max_speed = self.get_parameter("max_wheel_speed_mmps").get_parameter_value().double_value
+        hold_control = (
+            self.get_parameter("hold_control_during_cmd_vel")
+            .get_parameter_value()
+            .bool_value
+        )
         linear_mps = msg.linear.x
         angular_rps = msg.angular.z
         left = (linear_mps - angular_rps * (wheel_track_mm / 1000.0) / 2.0) * 1000.0
@@ -555,13 +659,18 @@ class VectorRos2Driver(Node):
             left = max(-max_speed, min(max_speed, left))
             right = max(-max_speed, min(max_speed, right))
         self._last_cmd_time = self.get_clock().now()
-        self._cmd_executor.submit(self._set_wheel_speeds, left, right)
+        self._cmd_executor.submit(self._set_wheel_speeds, left, right, hold_control)
 
-    def _set_wheel_speeds(self, left_mmps: float, right_mmps: float):
+    def _set_wheel_speeds(self, left_mmps: float, right_mmps: float, hold_control: bool):
         if self._robot is None:
             return
         try:
-            self._sdk_call(self._robot.motors.set_wheel_motors, left_mmps, right_mmps)
+            self._call_with_control(
+                lambda: self._sdk_call(
+                    self._robot.motors.set_wheel_motors, left_mmps, right_mmps
+                ),
+                hold_for_cmd_vel=hold_control,
+            )
         except Exception:
             pass
 
@@ -571,9 +680,17 @@ class VectorRos2Driver(Node):
         angle = msg.data
         try:
             if hasattr(util, "radians"):
-                self._sdk_call(self._robot.behavior.set_head_angle, util.radians(angle))
+                self._call_with_control(
+                    lambda: self._sdk_call(
+                        self._robot.behavior.set_head_angle, util.radians(angle)
+                    )
+                )
             else:
-                self._sdk_call(self._robot.behavior.set_head_angle, util.Angle(radians=angle))
+                self._call_with_control(
+                    lambda: self._sdk_call(
+                        self._robot.behavior.set_head_angle, util.Angle(radians=angle)
+                    )
+                )
         except Exception:
             pass
 
@@ -592,7 +709,9 @@ class VectorRos2Driver(Node):
         if norm > 1.0:
             norm = 1.0
         try:
-            self._sdk_call(self._robot.behavior.set_lift_height, norm)
+            self._call_with_control(
+                lambda: self._sdk_call(self._robot.behavior.set_lift_height, norm)
+            )
         except Exception:
             pass
 
@@ -608,7 +727,9 @@ class VectorRos2Driver(Node):
             response.message = "say_text: empty text"
             return response
         try:
-            self._sdk_call(self._robot.behavior.say_text, text)
+            self._call_with_control(
+                lambda: self._sdk_call(self._robot.behavior.say_text, text)
+            )
         except Exception as exc:
             response.success = False
             response.message = f"say_text: {exc}"
@@ -617,9 +738,95 @@ class VectorRos2Driver(Node):
         response.message = "say_text: ok"
         return response
 
+    def _parse_behavior_control_level(self, value: str):
+        if value is None:
+            return None
+        if anki_vector is None or not hasattr(anki_vector, "connection"):
+            raise RuntimeError("anki_vector not available for behavior control level")
+        level = value.strip().lower()
+        if level in ("none", "off", "false", "0"):
+            return None
+        if level in ("default",):
+            return anki_vector.connection.ControlPriorityLevel.DEFAULT_PRIORITY
+        if level in ("override", "override_behaviors"):
+            return anki_vector.connection.ControlPriorityLevel.OVERRIDE_BEHAVIORS_PRIORITY
+        if level in ("reserve", "reserve_control"):
+            return anki_vector.connection.ControlPriorityLevel.RESERVE_CONTROL
+        raise ValueError(
+            "behavior_control_level must be one of: none, default, override, reserve"
+        )
+
+    def _effective_control_level(self):
+        if self._behavior_control_level is not None:
+            return self._behavior_control_level
+        return anki_vector.connection.ControlPriorityLevel.DEFAULT_PRIORITY
+
+    def _ensure_control(self, hold_for_cmd_vel: bool = False):
+        if self._robot is None:
+            return False
+        with self._control_lock:
+            if self._control_held:
+                if hold_for_cmd_vel:
+                    self._control_held_by_cmd_vel = True
+                return True
+            level = self._effective_control_level()
+            self._robot.conn.request_control(level)
+            self._control_held = True
+            if hold_for_cmd_vel:
+                self._control_held_by_cmd_vel = True
+            return True
+
+    def _release_control(self, force: bool = False):
+        if self._robot is None:
+            return
+        with self._control_lock:
+            if not force and not self._control_held:
+                return
+            try:
+                self._robot.conn.release_control()
+            except Exception:
+                pass
+            self._control_held = False
+            self._control_held_by_cmd_vel = False
+
+    def _call_with_control(self, func, hold_for_cmd_vel: bool = False):
+        if not self._ensure_control(hold_for_cmd_vel=hold_for_cmd_vel):
+            raise RuntimeError("failed to acquire control")
+        try:
+            func()
+        finally:
+            if not self._control_held_by_cmd_vel:
+                self._release_control()
+
+    def _on_set_parameters(self, params):
+        behavior_level = self._behavior_control_level
+        hold_cmd_vel = self.get_parameter("hold_control_during_cmd_vel").value
+        for param in params:
+            if param.name == "behavior_control_level":
+                try:
+                    behavior_level = self._parse_behavior_control_level(param.value)
+                except Exception as exc:
+                    return SetParametersResult(successful=False, reason=str(exc))
+            if param.name == "hold_control_during_cmd_vel":
+                hold_cmd_vel = bool(param.value)
+
+        self._behavior_control_level = behavior_level
+        if self._robot is not None:
+            self._robot.conn._behavior_control_level = behavior_level
+            if behavior_level is None:
+                self._release_control(force=True)
+            if not hold_cmd_vel and self._control_held_by_cmd_vel:
+                self._release_control()
+        level_label = "none" if behavior_level is None else behavior_level.name
+        self.get_logger().info(
+            f"Updated behavior_control_level={level_label} "
+            f"hold_control_during_cmd_vel={hold_cmd_vel}"
+        )
+        return SetParametersResult(successful=True)
+
     def destroy_node(self):
         try:
-            for srv in self._services:
+            for srv in self._service_handles:
                 srv.destroy()
             if self._robot is not None:
                 self._robot.disconnect()
@@ -630,12 +837,15 @@ class VectorRos2Driver(Node):
 def main():
     rclpy.init()
     node = VectorRos2Driver()
+    executor = rclpy.executors.MultiThreadedExecutor()
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
         node.destroy_node()
+        executor.shutdown()
         rclpy.shutdown()
 
 

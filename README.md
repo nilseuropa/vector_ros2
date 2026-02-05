@@ -87,6 +87,13 @@ ros2 launch vector_ros2 vector.launch.py
 - `battery_hz` (float): publish rate for battery
 - `camera_hz` (float): publish rate for camera
 - `cmd_vel_timeout_sec` (float): stop motors if no cmd_vel for this duration
+- `control_release_timeout_sec` (float): release control after cmd_vel timeout (seconds)
+- `behavior_control_level` (string): `default`, `override`, `reserve`, or `none` (default `override`)
+  - `default`: DEFAULT_PRIORITY (above mandatory physical reactions, below trigger‑word detection)
+  - `override`: OVERRIDE_BEHAVIORS_PRIORITY (above mandatory physical reactions and trigger‑word detection)
+  - `reserve`: RESERVE_CONTROL (holds control before/after other SDK connections; disables idle behaviors)
+  - `none`: do not hold control by default; driver requests control only when needed
+- `hold_control_during_cmd_vel` (bool): keep control while cmd_vel is active
 - `enable_camera` (bool)
 - `enable_face_detection` (bool)
 - `enable_nav_map_feed` (bool)
