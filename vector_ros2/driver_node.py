@@ -64,12 +64,15 @@ class VectorRos2Driver(Node):
             )
 
         self._robot = None
-        self._robot_lock = threading.Lock()
+        self._sdk_executor = ThreadPoolExecutor(max_workers=1)
         self._cmd_executor = ThreadPoolExecutor(max_workers=1)
         self._last_cmd_time = None
         self._last_image_id = None
         self._warned_lift_angle = False
         self._tf_broadcaster = TransformBroadcaster(self)
+        self._state_inflight = False
+        self._battery_inflight = False
+        self._camera_inflight = False
 
         self._setup_publishers()
         self._setup_subscribers()
@@ -168,20 +171,74 @@ class VectorRos2Driver(Node):
         # SDK uses q0 as w.
         return q0, q1, q2, q3
 
+    def _has_subscribers(self, publisher):
+        return publisher.get_subscription_count() > 0
+
+    def _sdk_call(self, func, *args, **kwargs):
+        future = self._sdk_executor.submit(func, *args, **kwargs)
+        return future.result()
+
     def _publish_state(self):
         if self._robot is None:
             return
+        if self._state_inflight:
+            return
+        self._state_inflight = True
 
-        with self._robot_lock:
-            pose = self._robot.pose
-            accel = self._robot.accel
-            gyro = self._robot.gyro
-            head_angle = getattr(self._robot, "head_angle_rad", None)
-            lift_height = getattr(self._robot, "lift_height_mm", None)
-            lift_angle = getattr(self._robot, "lift_angle_rad", None)
-            touch = self._robot.touch.last_sensor_reading
-            proximity = self._robot.proximity.last_sensor_reading
-            status = getattr(self._robot, "status", None)
+        publish_tf = self.get_parameter("publish_tf").get_parameter_value().bool_value
+        need_imu = self._has_subscribers(self.pub_imu)
+        need_pose = (
+            publish_tf
+            or need_imu
+            or self._has_subscribers(self.pub_pose)
+            or self._has_subscribers(self.pub_odom)
+        )
+        need_proximity = self._has_subscribers(self.pub_range)
+        need_touch = self._has_subscribers(self.pub_touch) or self._has_subscribers(
+            self.pub_touch_raw
+        )
+        need_status = self._has_subscribers(self.pub_cliff)
+        need_joint = True
+        need_head_angle = need_joint or self._has_subscribers(self.pub_head_angle)
+        need_lift = need_joint or self._has_subscribers(self.pub_lift_height)
+        lift_use_angle = self.get_parameter("lift_use_angle").get_parameter_value().bool_value
+
+        def _read_state():
+            pose = self._robot.pose if need_pose else None
+            accel = self._robot.accel if need_imu else None
+            gyro = self._robot.gyro if need_imu else None
+            head_angle = (
+                getattr(self._robot, "head_angle_rad", None) if need_head_angle else None
+            )
+            lift_height = (
+                getattr(self._robot, "lift_height_mm", None) if need_lift else None
+            )
+            lift_angle = (
+                getattr(self._robot, "lift_angle_rad", None)
+                if need_joint and lift_use_angle
+                else None
+            )
+            touch = self._robot.touch.last_sensor_reading if need_touch else None
+            proximity = (
+                self._robot.proximity.last_sensor_reading if need_proximity else None
+            )
+            status = getattr(self._robot, "status", None) if need_status else None
+            return pose, accel, gyro, head_angle, lift_height, lift_angle, touch, proximity, status
+
+        try:
+            (
+                pose,
+                accel,
+                gyro,
+                head_angle,
+                lift_height,
+                lift_angle,
+                touch,
+                proximity,
+                status,
+            ) = self._sdk_call(_read_state)
+        finally:
+            self._state_inflight = False
 
         stamp = self._stamp()
         frame_odom = self.get_parameter("frame_odom").get_parameter_value().string_value
@@ -189,27 +246,28 @@ class VectorRos2Driver(Node):
         frame_footprint = (
             self.get_parameter("frame_footprint").get_parameter_value().string_value
         )
-        publish_tf = self.get_parameter("publish_tf").get_parameter_value().bool_value
 
-        if pose is not None:
+        if pose is not None and need_pose:
             pose_msg = PoseStamped()
             pose_msg.header.stamp = stamp
             pose_msg.header.frame_id = frame_odom
+            q0, q1, q2, q3 = self._get_pose_quat(pose)
             pose_msg.pose.position.x = pose.position.x / 1000.0
             pose_msg.pose.position.y = pose.position.y / 1000.0
             pose_msg.pose.position.z = pose.position.z / 1000.0
-            q0, q1, q2, q3 = self._get_pose_quat(pose)
             pose_msg.pose.orientation.w = q0
             pose_msg.pose.orientation.x = q1
             pose_msg.pose.orientation.y = q2
             pose_msg.pose.orientation.z = q3
-            self.pub_pose.publish(pose_msg)
+            if self._has_subscribers(self.pub_pose):
+                self.pub_pose.publish(pose_msg)
 
-            odom = Odometry()
-            odom.header = pose_msg.header
-            odom.child_frame_id = frame_footprint
-            odom.pose.pose = pose_msg.pose
-            self.pub_odom.publish(odom)
+            if self._has_subscribers(self.pub_odom):
+                odom = Odometry()
+                odom.header = pose_msg.header
+                odom.child_frame_id = frame_footprint
+                odom.pose.pose = pose_msg.pose
+                self.pub_odom.publish(odom)
 
             if publish_tf:
                 tf_msg = TransformStamped()
@@ -222,28 +280,37 @@ class VectorRos2Driver(Node):
                 tf_msg.transform.rotation = pose_msg.pose.orientation
                 self._tf_broadcaster.sendTransform(tf_msg)
 
-        imu_msg = Imu()
-        imu_msg.header.stamp = stamp
-        imu_msg.header.frame_id = frame_base
-        if pose is not None:
-            q0, q1, q2, q3 = self._get_pose_quat(pose)
-            imu_msg.orientation.w = q0
-            imu_msg.orientation.x = q1
-            imu_msg.orientation.y = q2
-            imu_msg.orientation.z = q3
-        accel_scale = self.get_parameter("imu_accel_scale").get_parameter_value().double_value
-        gyro_scale = self.get_parameter("imu_gyro_scale").get_parameter_value().double_value
-        if accel is not None:
-            imu_msg.linear_acceleration.x = float(accel.x) * accel_scale
-            imu_msg.linear_acceleration.y = float(accel.y) * accel_scale
-            imu_msg.linear_acceleration.z = float(accel.z) * accel_scale
-        if gyro is not None:
-            imu_msg.angular_velocity.x = float(gyro.x) * gyro_scale
-            imu_msg.angular_velocity.y = float(gyro.y) * gyro_scale
-            imu_msg.angular_velocity.z = float(gyro.z) * gyro_scale
-        self.pub_imu.publish(imu_msg)
+        if need_imu:
+            imu_msg = Imu()
+            imu_msg.header.stamp = stamp
+            imu_msg.header.frame_id = frame_base
+            if pose is not None:
+                q0, q1, q2, q3 = self._get_pose_quat(pose)
+                imu_msg.orientation.w = q0
+                imu_msg.orientation.x = q1
+                imu_msg.orientation.y = q2
+                imu_msg.orientation.z = q3
+            accel_scale = (
+                self.get_parameter("imu_accel_scale")
+                .get_parameter_value()
+                .double_value
+            )
+            gyro_scale = (
+                self.get_parameter("imu_gyro_scale")
+                .get_parameter_value()
+                .double_value
+            )
+            if accel is not None:
+                imu_msg.linear_acceleration.x = float(accel.x) * accel_scale
+                imu_msg.linear_acceleration.y = float(accel.y) * accel_scale
+                imu_msg.linear_acceleration.z = float(accel.z) * accel_scale
+            if gyro is not None:
+                imu_msg.angular_velocity.x = float(gyro.x) * gyro_scale
+                imu_msg.angular_velocity.y = float(gyro.y) * gyro_scale
+                imu_msg.angular_velocity.z = float(gyro.z) * gyro_scale
+            self.pub_imu.publish(imu_msg)
 
-        if proximity is not None:
+        if need_proximity and proximity is not None:
             range_msg = Range()
             range_msg.header.stamp = stamp
             range_msg.header.frame_id = frame_base
@@ -257,16 +324,18 @@ class VectorRos2Driver(Node):
                     range_msg.range = dist_mm / 1000.0
             self.pub_range.publish(range_msg)
 
-        if touch is not None:
+        if need_touch and touch is not None:
             touch_msg = Bool()
             touch_msg.data = bool(getattr(touch, "is_being_touched", False))
-            self.pub_touch.publish(touch_msg)
+            if self._has_subscribers(self.pub_touch):
+                self.pub_touch.publish(touch_msg)
 
             touch_raw = Float32()
             touch_raw.data = float(getattr(touch, "raw_touch_value", 0.0))
-            self.pub_touch_raw.publish(touch_raw)
+            if self._has_subscribers(self.pub_touch_raw):
+                self.pub_touch_raw.publish(touch_raw)
 
-        if status is not None:
+        if need_status and status is not None:
             cliff_msg = Bool()
             cliff_msg.data = bool(getattr(status, "is_cliff_detected", False))
             self.pub_cliff.publish(cliff_msg)
@@ -284,7 +353,6 @@ class VectorRos2Driver(Node):
         if head_angle is not None:
             head_pos = float(head_angle) * head_scale + head_offset
         lift_pos = 0.0
-        lift_use_angle = self.get_parameter("lift_use_angle").get_parameter_value().bool_value
         if lift_use_angle and lift_angle is not None:
             lift_pos = float(lift_angle)
         elif lift_height is not None:
@@ -308,11 +376,11 @@ class VectorRos2Driver(Node):
         joint.position = [head_pos, lift_pos]
         self.pub_joint.publish(joint)
 
-        if head_angle is not None:
+        if head_angle is not None and self._has_subscribers(self.pub_head_angle):
             head_msg = Float32()
             head_msg.data = float(head_angle)
             self.pub_head_angle.publish(head_msg)
-        if lift_height is not None:
+        if lift_height is not None and self._has_subscribers(self.pub_lift_height):
             lift_msg = Float32()
             lift_msg.data = float(lift_height) / 1000.0
             self.pub_lift_height.publish(lift_msg)
@@ -322,11 +390,18 @@ class VectorRos2Driver(Node):
     def _publish_battery(self):
         if self._robot is None:
             return
-        with self._robot_lock:
+        if not self._has_subscribers(self.pub_battery):
+            return
+        if self._battery_inflight:
+            return
+        self._battery_inflight = True
+        try:
             try:
-                batt = self._robot.get_battery_state()
+                batt = self._sdk_call(self._robot.get_battery_state)
             except Exception:
                 return
+        finally:
+            self._battery_inflight = False
         msg = BatteryState()
         msg.header.stamp = self._stamp()
         msg.power_supply_status = BatteryState.POWER_SUPPLY_STATUS_UNKNOWN
@@ -347,8 +422,15 @@ class VectorRos2Driver(Node):
             return
         if not self.get_parameter("enable_camera").get_parameter_value().bool_value:
             return
-        with self._robot_lock:
-            image = self._robot.camera.latest_image
+        if not self._has_subscribers(self.pub_image):
+            return
+        if self._camera_inflight:
+            return
+        self._camera_inflight = True
+        try:
+            image = self._sdk_call(lambda: self._robot.camera.latest_image)
+        finally:
+            self._camera_inflight = False
         if image is None:
             return
         image_id = getattr(image, "image_id", None)
@@ -398,24 +480,22 @@ class VectorRos2Driver(Node):
     def _set_wheel_speeds(self, left_mmps: float, right_mmps: float):
         if self._robot is None:
             return
-        with self._robot_lock:
-            try:
-                self._robot.motors.set_wheel_motors(left_mmps, right_mmps)
-            except Exception:
-                pass
+        try:
+            self._sdk_call(self._robot.motors.set_wheel_motors, left_mmps, right_mmps)
+        except Exception:
+            pass
 
     def _on_head_angle(self, msg: Float32):
         if self._robot is None:
             return
         angle = msg.data
-        with self._robot_lock:
-            try:
-                if hasattr(util, "radians"):
-                    self._robot.behavior.set_head_angle(util.radians(angle))
-                else:
-                    self._robot.behavior.set_head_angle(util.Angle(radians=angle))
-            except Exception:
-                pass
+        try:
+            if hasattr(util, "radians"):
+                self._sdk_call(self._robot.behavior.set_head_angle, util.radians(angle))
+            else:
+                self._sdk_call(self._robot.behavior.set_head_angle, util.Angle(radians=angle))
+        except Exception:
+            pass
 
     def _on_lift_height(self, msg: Float32):
         if self._robot is None:
@@ -431,11 +511,10 @@ class VectorRos2Driver(Node):
             norm = 0.0
         if norm > 1.0:
             norm = 1.0
-        with self._robot_lock:
-            try:
-                self._robot.behavior.set_lift_height(norm)
-            except Exception:
-                pass
+        try:
+            self._sdk_call(self._robot.behavior.set_lift_height, norm)
+        except Exception:
+            pass
 
     def _on_say_text(self, msg: String):
         if self._robot is None:
@@ -443,11 +522,10 @@ class VectorRos2Driver(Node):
         text = msg.data.strip()
         if not text:
             return
-        with self._robot_lock:
-            try:
-                self._robot.behavior.say_text(text)
-            except Exception:
-                pass
+        try:
+            self._sdk_call(self._robot.behavior.say_text, text)
+        except Exception:
+            pass
 
     def _on_animation(self, msg: String):
         if self._robot is None:
@@ -455,23 +533,21 @@ class VectorRos2Driver(Node):
         trigger = msg.data.strip()
         if not trigger:
             return
-        with self._robot_lock:
-            try:
-                self._robot.anim.play_animation_trigger(trigger)
-            except Exception:
-                pass
+        try:
+            self._sdk_call(self._robot.anim.play_animation_trigger, trigger)
+        except Exception:
+            pass
 
     def _on_drive_charger(self, msg: Bool):
         if self._robot is None:
             return
-        with self._robot_lock:
-            try:
-                if msg.data:
-                    self._robot.behavior.drive_on_charger()
-                else:
-                    self._robot.behavior.drive_off_charger()
-            except Exception:
-                pass
+        try:
+            if msg.data:
+                self._sdk_call(self._robot.behavior.drive_on_charger)
+            else:
+                self._sdk_call(self._robot.behavior.drive_off_charger)
+        except Exception:
+            pass
 
     def destroy_node(self):
         try:
