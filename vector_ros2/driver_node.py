@@ -95,8 +95,6 @@ class VectorRos2Driver(Node):
         self.pub_touch_raw = self.create_publisher(Float32, "touch/raw", 10)
         self.pub_cliff = self.create_publisher(Bool, "cliff_detected", 10)
         self.pub_joint = self.create_publisher(JointState, "joint_states", 10)
-        self.pub_head_angle = self.create_publisher(Float32, "head_angle", 10)
-        self.pub_lift_height = self.create_publisher(Float32, "lift_height", 10)
         self.pub_image = self.create_publisher(Image, "camera/image_raw", 10)
 
     def _setup_subscribers(self):
@@ -290,8 +288,8 @@ class VectorRos2Driver(Node):
         )
         need_status = self._has_subscribers(self.pub_cliff)
         need_joint = True
-        need_head_angle = need_joint or self._has_subscribers(self.pub_head_angle)
-        need_lift = need_joint or self._has_subscribers(self.pub_lift_height)
+        need_head_angle = need_joint
+        need_lift = need_joint
         lift_use_angle = self.get_parameter("lift_use_angle").get_parameter_value().bool_value
 
         def _read_state():
@@ -466,15 +464,6 @@ class VectorRos2Driver(Node):
                 self._warned_lift_angle = True
         joint.position = [head_pos, lift_pos]
         self.pub_joint.publish(joint)
-
-        if head_angle is not None and self._has_subscribers(self.pub_head_angle):
-            head_msg = Float32()
-            head_msg.data = float(head_angle)
-            self.pub_head_angle.publish(head_msg)
-        if lift_height is not None and self._has_subscribers(self.pub_lift_height):
-            lift_msg = Float32()
-            lift_msg.data = float(lift_height) / 1000.0
-            self.pub_lift_height.publish(lift_msg)
 
         self._handle_cmd_timeout()
 

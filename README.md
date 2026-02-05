@@ -14,8 +14,6 @@ Publishes:
 - `touch/raw` (std_msgs/Float32)
 - `cliff_detected` (std_msgs/Bool)
 - `joint_states` (sensor_msgs/JointState) for head and lift (URDF joint names)
-- `head_angle` (std_msgs/Float32)
-- `lift_height` (std_msgs/Float32)
 - `camera/image_raw` (sensor_msgs/Image)
 
 Subscribes:
