@@ -72,7 +72,7 @@ def generate_launch_description():
                         "always_hold_control": False,
                         "enable_camera": True,
                         "enable_face_detection": False,
-                        "enable_nav_map_feed": False,
+                        "enable_nav_map_feed": True,
                         "enable_custom_object_detection": False,
                         "enable_audio_feed": False,
                         "frame_odom": "odom",

@@ -96,6 +96,7 @@ class VectorRos2Driver(Node):
         self._battery_inflight = False
         self._camera_inflight = False
         self._nav_map_inflight = False
+        self._nav_map_all_unknown_warned = False
         self._service_handles = []
         self._parameter_service = ParameterService(self)
         self._parameter_service_fallback = []
@@ -648,11 +649,15 @@ class VectorRos2Driver(Node):
         self._nav_map_inflight = True
         try:
             try:
-                nav_map = self._sdk_call(lambda: self._robot.nav_map.latest_nav_map)
+                nav_map = self._sdk_call(
+                    lambda: getattr(self._robot.nav_map, "_latest_nav_map", None)
+                )
             except Exception:
                 return
         finally:
             self._nav_map_inflight = False
+        if nav_map is None:
+            return
 
         resolution = (
             self.get_parameter("nav_map_resolution_m")
@@ -661,40 +666,57 @@ class VectorRos2Driver(Node):
         )
         if resolution <= 0:
             return
-        size_mm = float(nav_map.size)
-        resolution_mm = resolution * 1000.0
-        width = max(1, int(round(size_mm / resolution_mm)))
+        size_raw = float(nav_map.size)
+        # Heuristic: SDKs typically report size/center in mm, but some builds use meters.
+        unit_scale = 1.0 if size_raw < 10.0 else 0.001  # raw units -> meters
+        size_m = size_raw * unit_scale
+        width = max(1, int(round(size_m / resolution)))
         height = width
-        origin_x = (nav_map.center.x - (size_mm / 2.0)) / 1000.0
-        origin_y = (nav_map.center.y - (size_mm / 2.0)) / 1000.0
+        center_x_m = float(nav_map.center.x) * unit_scale
+        center_y_m = float(nav_map.center.y) * unit_scale
+        origin_x = center_x_m - (size_m / 2.0)
+        origin_y = center_y_m - (size_m / 2.0)
+
+        def _content_value(content):
+            if content is None:
+                return None
+            if hasattr(content, "value"):
+                return int(content.value)
+            if hasattr(content, "name") and hasattr(content, "value"):
+                return int(content.value)
+            try:
+                return int(content)
+            except Exception:
+                return None
 
         def _content_to_occupancy(content):
-            if content is None:
+            value = _content_value(content)
+            if value is None:
                 return -1
-            name = getattr(content, "name", "")
-            if name in ("ClearOfObstacle", "ClearOfCliff"):
+            if value in (1, 2):
                 return 0
-            if name in (
-                "ObstacleCube",
-                "ObstacleProximity",
-                "ObstacleProximityExplored",
-                "ObstacleUnrecognized",
-                "Cliff",
-            ):
+            if value in (3, 4, 5, 6, 7):
                 return 100
-            if name in ("InterestingEdge", "NonInterestingEdge"):
-                return 50
+            if value in (8, 9):
+                return 100
             return -1
 
         data = []
+        counts = {}
+        has_known = False
         for y in range(height):
             y_m = origin_y + (y + 0.5) * resolution
-            y_mm = y_m * 1000.0
+            y_units = y_m / unit_scale
             for x in range(width):
                 x_m = origin_x + (x + 0.5) * resolution
-                x_mm = x_m * 1000.0
-                content = nav_map.get_content(x_mm, y_mm)
-                data.append(_content_to_occupancy(content))
+                x_units = x_m / unit_scale
+                content = nav_map.get_content(x_units, y_units)
+                value = _content_value(content)
+                counts[value] = counts.get(value, 0) + 1
+                occ = _content_to_occupancy(content)
+                if occ != -1:
+                    has_known = True
+                data.append(occ)
 
         msg = OccupancyGrid()
         msg.header.stamp = self._stamp()
@@ -708,6 +730,14 @@ class VectorRos2Driver(Node):
         msg.info.origin.orientation.w = 1.0
         msg.data = data
         self.pub_nav_map.publish(msg)
+        if not has_known and not self._nav_map_all_unknown_warned:
+            self.get_logger().warn(
+                "nav_map contains only unknown cells; ensure nav map feed is updating and units are correct"
+            )
+            self._nav_map_all_unknown_warned = True
+        if not hasattr(self, "_nav_map_counts_logged"):
+            self.get_logger().info(f"nav_map content value counts: {counts}")
+            self._nav_map_counts_logged = True
 
     def _handle_cmd_timeout(self):
         timeout = self.get_parameter("cmd_vel_timeout_sec").get_parameter_value().double_value
