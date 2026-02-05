@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 import rclpy
 from rclpy.node import Node
 from rclpy.parameter_service import ParameterService
+from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.qos import qos_profile_parameters
 from rcl_interfaces.srv import (
     DescribeParameters,
@@ -85,7 +86,8 @@ class VectorRos2Driver(Node):
             )
 
         self._robot = None
-        self._sdk_executor = ThreadPoolExecutor(max_workers=1)
+        self._sdk_state_executor = ThreadPoolExecutor(max_workers=1)
+        self._sdk_cmd_executor = ThreadPoolExecutor(max_workers=1)
         self._cmd_executor = ThreadPoolExecutor(max_workers=1)
         self._control_executor = ThreadPoolExecutor(max_workers=1)
         self._last_cmd_time = None
@@ -106,6 +108,7 @@ class VectorRos2Driver(Node):
         self._control_held_by_cmd_vel = False
         self._behavior_control_level = None
         self._always_hold_control = False
+        self._timer_group = ReentrantCallbackGroup()
 
         self._behavior_control_level = self._parse_behavior_control_level(
             self.get_parameter("behavior_control_level").get_parameter_value().string_value
@@ -271,31 +274,31 @@ class VectorRos2Driver(Node):
     def _srv_start_exploration(self, _request, _context):
         return self._srv_call(
             "start_exploration",
-            lambda: self._sdk_call(self._robot.behavior.look_around_in_place),
+            lambda: self._sdk_call_cmd(self._robot.behavior.look_around_in_place),
         )
 
     def _srv_fetch_cube(self, _request, _context):
         def _run():
-            cube = self._sdk_call(lambda: self._robot.world.connected_light_cube)
+            cube = self._sdk_call_cmd(lambda: self._robot.world.connected_light_cube)
             if cube is None:
-                self._sdk_call(self._robot.world.connect_cube)
-                cube = self._sdk_call(lambda: self._robot.world.connected_light_cube)
+                self._sdk_call_cmd(self._robot.world.connect_cube)
+                cube = self._sdk_call_cmd(lambda: self._robot.world.connected_light_cube)
             if cube is None:
                 raise RuntimeError("No cube connected")
-            self._sdk_call(self._robot.behavior.pickup_object, cube)
+            self._sdk_call_cmd(self._robot.behavior.pickup_object, cube)
 
         return self._srv_call("fetch_cube", _run)
 
     def _srv_go_home(self, _request, _context):
         return self._srv_call(
             "go_home",
-            lambda: self._sdk_call(self._robot.behavior.drive_on_charger),
+            lambda: self._sdk_call_cmd(self._robot.behavior.drive_on_charger),
         )
 
     def _srv_drive_off_charger(self, _request, _context):
         return self._srv_call(
             "drive_off_charger",
-            lambda: self._sdk_call(self._robot.behavior.drive_off_charger),
+            lambda: self._sdk_call_cmd(self._robot.behavior.drive_off_charger),
         )
 
     def _srv_play_animation_trigger(self, request, _context):
@@ -313,13 +316,13 @@ class VectorRos2Driver(Node):
             if protocol is not None and hasattr(protocol, "AnimationTrigger"):
                 anim_trigger = protocol.AnimationTrigger(name=trigger)
                 self._call_with_control(
-                    lambda: self._sdk_call(
+                    lambda: self._sdk_call_cmd(
                         self._robot.anim.play_animation_trigger, anim_trigger
                     )
                 )
             else:
                 self._call_with_control(
-                    lambda: self._sdk_call(
+                    lambda: self._sdk_call_cmd(
                         self._robot.anim.play_animation_trigger, trigger
                     )
                 )
@@ -339,13 +342,13 @@ class VectorRos2Driver(Node):
         nav_map_hz = self.get_parameter("nav_map_hz").get_parameter_value().double_value
 
         if state_hz > 0:
-            self.create_timer(1.0 / state_hz, self._publish_state)
+            self.create_timer(1.0 / state_hz, self._publish_state, callback_group=self._timer_group)
         if battery_hz > 0:
-            self.create_timer(1.0 / battery_hz, self._publish_battery)
+            self.create_timer(1.0 / battery_hz, self._publish_battery, callback_group=self._timer_group)
         if camera_hz > 0:
-            self.create_timer(1.0 / camera_hz, self._publish_camera)
+            self.create_timer(1.0 / camera_hz, self._publish_camera, callback_group=self._timer_group)
         if nav_map_hz > 0:
-            self.create_timer(1.0 / nav_map_hz, self._publish_nav_map)
+            self.create_timer(1.0 / nav_map_hz, self._publish_nav_map, callback_group=self._timer_group)
 
     def _stamp(self):
         now = self.get_clock().now().to_msg()
@@ -370,7 +373,11 @@ class VectorRos2Driver(Node):
         return publisher.get_subscription_count() > 0
 
     def _sdk_call(self, func, *args, **kwargs):
-        future = self._sdk_executor.submit(func, *args, **kwargs)
+        future = self._sdk_state_executor.submit(func, *args, **kwargs)
+        return future.result()
+
+    def _sdk_call_cmd(self, func, *args, **kwargs):
+        future = self._sdk_cmd_executor.submit(func, *args, **kwargs)
         return future.result()
 
     def _publish_state(self):
@@ -398,7 +405,7 @@ class VectorRos2Driver(Node):
         need_lift = need_joint
         lift_use_angle = self.get_parameter("lift_use_angle").get_parameter_value().bool_value
 
-        def _read_state():
+        try:
             pose = self._robot.pose if need_pose else None
             accel = self._robot.accel if need_imu else None
             gyro = self._robot.gyro if need_imu else None
@@ -418,20 +425,6 @@ class VectorRos2Driver(Node):
                 self._robot.proximity.last_sensor_reading if need_proximity else None
             )
             status = getattr(self._robot, "status", None) if need_status else None
-            return pose, accel, gyro, head_angle, lift_height, lift_angle, touch, proximity, status
-
-        try:
-            (
-                pose,
-                accel,
-                gyro,
-                head_angle,
-                lift_height,
-                lift_angle,
-                touch,
-                proximity,
-                status,
-            ) = self._sdk_call(_read_state)
         finally:
             self._state_inflight = False
 
@@ -614,7 +607,7 @@ class VectorRos2Driver(Node):
             return
         self._camera_inflight = True
         try:
-            image = self._sdk_call(lambda: self._robot.camera.latest_image)
+            image = self._robot.camera.latest_image
         finally:
             self._camera_inflight = False
         if image is None:
@@ -783,7 +776,7 @@ class VectorRos2Driver(Node):
             return
         try:
             self._call_with_control(
-                lambda: self._sdk_call(
+                lambda: self._sdk_call_cmd(
                     self._robot.motors.set_wheel_motors, left_mmps, right_mmps
                 ),
                 hold_for_cmd_vel=hold_control,
@@ -798,13 +791,13 @@ class VectorRos2Driver(Node):
         try:
             if hasattr(util, "radians"):
                 self._call_with_control(
-                    lambda: self._sdk_call(
+                    lambda: self._sdk_call_cmd(
                         self._robot.behavior.set_head_angle, util.radians(angle)
                     )
                 )
             else:
                 self._call_with_control(
-                    lambda: self._sdk_call(
+                    lambda: self._sdk_call_cmd(
                         self._robot.behavior.set_head_angle, util.Angle(radians=angle)
                     )
                 )
@@ -827,7 +820,7 @@ class VectorRos2Driver(Node):
             norm = 1.0
         try:
             self._call_with_control(
-                lambda: self._sdk_call(self._robot.behavior.set_lift_height, norm)
+                lambda: self._sdk_call_cmd(self._robot.behavior.set_lift_height, norm)
             )
         except Exception:
             pass
@@ -845,7 +838,7 @@ class VectorRos2Driver(Node):
             return response
         try:
             self._call_with_control(
-                lambda: self._sdk_call(self._robot.behavior.say_text, text)
+                lambda: self._sdk_call_cmd(self._robot.behavior.say_text, text)
             )
         except Exception as exc:
             response.success = False
