@@ -14,6 +14,7 @@ Publishes:
 - `touch/raw` (std_msgs/Float32)
 - `cliff_detected` (std_msgs/Bool)
 - `joint_states` (sensor_msgs/JointState) for head and lift (URDF joint names)
+- `nav_map` (nav_msgs/OccupancyGrid)
 - `camera/image_raw` (sensor_msgs/Image)
 
 Subscribes:
@@ -87,6 +88,8 @@ ros2 launch vector_ros2 vector.launch.py
 - `battery_hz` (float): publish rate for battery
 - `camera_hz` (float): publish rate for camera
 - `cmd_vel_timeout_sec` (float): stop motors if no cmd_vel for this duration
+- `nav_map_hz` (float): publish rate for nav map
+- `nav_map_resolution_m` (float): nav map grid resolution (meters)
 - `control_release_timeout_sec` (float): release control after cmd_vel timeout (seconds)
 - `behavior_control_level` (string): `default`, `override`, `reserve`, or `none` (default `override`)
   - `default`: DEFAULT_PRIORITY (above mandatory physical reactions, below trigger‑word detection)
@@ -94,6 +97,7 @@ ros2 launch vector_ros2 vector.launch.py
   - `reserve`: RESERVE_CONTROL (holds control before/after other SDK connections; disables idle behaviors)
   - `none`: do not hold control by default; driver requests control only when needed
 - `hold_control_during_cmd_vel` (bool): keep control while cmd_vel is active
+- `always_hold_control` (bool): hold control continuously (prevents idle roaming)
 - `enable_camera` (bool)
 - `enable_face_detection` (bool)
 - `enable_nav_map_feed` (bool)

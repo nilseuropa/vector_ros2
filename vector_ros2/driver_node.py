@@ -19,7 +19,7 @@ from rcl_interfaces.msg import SetParametersResult
 from builtin_interfaces.msg import Time
 from geometry_msgs.msg import PoseStamped, Twist
 from geometry_msgs.msg import TransformStamped
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Odometry, OccupancyGrid
 from sensor_msgs.msg import BatteryState, Image, Imu, JointState, Range
 from std_msgs.msg import Bool, Float32
 from std_srvs.srv import Trigger
@@ -49,9 +49,12 @@ class VectorRos2Driver(Node):
         self.declare_parameter("battery_hz", 1.0)
         self.declare_parameter("camera_hz", 5.0)
         self.declare_parameter("cmd_vel_timeout_sec", 0.5)
+        self.declare_parameter("nav_map_hz", 1.0)
+        self.declare_parameter("nav_map_resolution_m", 0.02)
         self.declare_parameter("control_release_timeout_sec", 0.5)
         self.declare_parameter("behavior_control_level", "override")
         self.declare_parameter("hold_control_during_cmd_vel", True)
+        self.declare_parameter("always_hold_control", False)
         self.declare_parameter("enable_camera", True)
         self.declare_parameter("enable_face_detection", False)
         self.declare_parameter("enable_nav_map_feed", False)
@@ -84,6 +87,7 @@ class VectorRos2Driver(Node):
         self._robot = None
         self._sdk_executor = ThreadPoolExecutor(max_workers=1)
         self._cmd_executor = ThreadPoolExecutor(max_workers=1)
+        self._control_executor = ThreadPoolExecutor(max_workers=1)
         self._last_cmd_time = None
         self._last_image_id = None
         self._warned_lift_angle = False
@@ -91,6 +95,7 @@ class VectorRos2Driver(Node):
         self._state_inflight = False
         self._battery_inflight = False
         self._camera_inflight = False
+        self._nav_map_inflight = False
         self._service_handles = []
         self._parameter_service = ParameterService(self)
         self._parameter_service_fallback = []
@@ -99,9 +104,13 @@ class VectorRos2Driver(Node):
         self._control_held = False
         self._control_held_by_cmd_vel = False
         self._behavior_control_level = None
+        self._always_hold_control = False
 
         self._behavior_control_level = self._parse_behavior_control_level(
             self.get_parameter("behavior_control_level").get_parameter_value().string_value
+        )
+        self._always_hold_control = (
+            self.get_parameter("always_hold_control").get_parameter_value().bool_value
         )
         self.add_on_set_parameters_callback(self._on_set_parameters)
 
@@ -121,6 +130,7 @@ class VectorRos2Driver(Node):
         self.pub_touch_raw = self.create_publisher(Float32, "touch/raw", 10)
         self.pub_cliff = self.create_publisher(Bool, "cliff_detected", 10)
         self.pub_joint = self.create_publisher(JointState, "joint_states", 10)
+        self.pub_nav_map = self.create_publisher(OccupancyGrid, "nav_map", 1)
         self.pub_image = self.create_publisher(Image, "camera/image_raw", 10)
 
     def _ensure_parameter_services(self):
@@ -220,6 +230,7 @@ class VectorRos2Driver(Node):
         self._robot = anki_vector.Robot(**kwargs)
         self._robot.connect()
         self.get_logger().info("Vector connected.")
+        self._control_executor.submit(self._apply_control_policy)
 
         if enable_camera:
             self._robot.camera.init_camera_feed()
@@ -324,6 +335,7 @@ class VectorRos2Driver(Node):
         state_hz = self.get_parameter("state_hz").get_parameter_value().double_value
         battery_hz = self.get_parameter("battery_hz").get_parameter_value().double_value
         camera_hz = self.get_parameter("camera_hz").get_parameter_value().double_value
+        nav_map_hz = self.get_parameter("nav_map_hz").get_parameter_value().double_value
 
         if state_hz > 0:
             self.create_timer(1.0 / state_hz, self._publish_state)
@@ -331,6 +343,8 @@ class VectorRos2Driver(Node):
             self.create_timer(1.0 / battery_hz, self._publish_battery)
         if camera_hz > 0:
             self.create_timer(1.0 / camera_hz, self._publish_camera)
+        if nav_map_hz > 0:
+            self.create_timer(1.0 / nav_map_hz, self._publish_nav_map)
 
     def _stamp(self):
         now = self.get_clock().now().to_msg()
@@ -622,6 +636,79 @@ class VectorRos2Driver(Node):
         msg.data = raw.tobytes()
         self.pub_image.publish(msg)
 
+    def _publish_nav_map(self):
+        if self._robot is None:
+            return
+        if not self.get_parameter("enable_nav_map_feed").get_parameter_value().bool_value:
+            return
+        if not self._has_subscribers(self.pub_nav_map):
+            return
+        if self._nav_map_inflight:
+            return
+        self._nav_map_inflight = True
+        try:
+            try:
+                nav_map = self._sdk_call(lambda: self._robot.nav_map.latest_nav_map)
+            except Exception:
+                return
+        finally:
+            self._nav_map_inflight = False
+
+        resolution = (
+            self.get_parameter("nav_map_resolution_m")
+            .get_parameter_value()
+            .double_value
+        )
+        if resolution <= 0:
+            return
+        size_mm = float(nav_map.size)
+        resolution_mm = resolution * 1000.0
+        width = max(1, int(round(size_mm / resolution_mm)))
+        height = width
+        origin_x = (nav_map.center.x - (size_mm / 2.0)) / 1000.0
+        origin_y = (nav_map.center.y - (size_mm / 2.0)) / 1000.0
+
+        def _content_to_occupancy(content):
+            if content is None:
+                return -1
+            name = getattr(content, "name", "")
+            if name in ("ClearOfObstacle", "ClearOfCliff"):
+                return 0
+            if name in (
+                "ObstacleCube",
+                "ObstacleProximity",
+                "ObstacleProximityExplored",
+                "ObstacleUnrecognized",
+                "Cliff",
+            ):
+                return 100
+            if name in ("InterestingEdge", "NonInterestingEdge"):
+                return 50
+            return -1
+
+        data = []
+        for y in range(height):
+            y_m = origin_y + (y + 0.5) * resolution
+            y_mm = y_m * 1000.0
+            for x in range(width):
+                x_m = origin_x + (x + 0.5) * resolution
+                x_mm = x_m * 1000.0
+                content = nav_map.get_content(x_mm, y_mm)
+                data.append(_content_to_occupancy(content))
+
+        msg = OccupancyGrid()
+        msg.header.stamp = self._stamp()
+        msg.header.frame_id = self.get_parameter("frame_odom").get_parameter_value().string_value
+        msg.info.resolution = float(resolution)
+        msg.info.width = width
+        msg.info.height = height
+        msg.info.origin.position.x = origin_x
+        msg.info.origin.position.y = origin_y
+        msg.info.origin.position.z = 0.0
+        msg.info.origin.orientation.w = 1.0
+        msg.data = data
+        self.pub_nav_map.publish(msg)
+
     def _handle_cmd_timeout(self):
         timeout = self.get_parameter("cmd_vel_timeout_sec").get_parameter_value().double_value
         if timeout <= 0:
@@ -789,18 +876,44 @@ class VectorRos2Driver(Node):
             self._control_held = False
             self._control_held_by_cmd_vel = False
 
+    def _should_hold_always(self):
+        return (
+            self._behavior_control_level
+            == anki_vector.connection.ControlPriorityLevel.OVERRIDE_BEHAVIORS_PRIORITY
+        ) or self._always_hold_control
+
     def _call_with_control(self, func, hold_for_cmd_vel: bool = False):
         if not self._ensure_control(hold_for_cmd_vel=hold_for_cmd_vel):
             raise RuntimeError("failed to acquire control")
         try:
             func()
         finally:
+            if self._should_hold_always():
+                return
             if not self._control_held_by_cmd_vel:
                 self._release_control()
+
+    def _apply_control_policy(self):
+        if self._robot is None:
+            return
+        if self._should_hold_always():
+            self._ensure_control()
+            return
+        hold_cmd_vel = (
+            self.get_parameter("hold_control_during_cmd_vel")
+            .get_parameter_value()
+            .bool_value
+        )
+        if not hold_cmd_vel:
+            self._release_control(force=True)
+            return
+        if self._control_held and not self._control_held_by_cmd_vel:
+            self._release_control(force=True)
 
     def _on_set_parameters(self, params):
         behavior_level = self._behavior_control_level
         hold_cmd_vel = self.get_parameter("hold_control_during_cmd_vel").value
+        always_hold = self.get_parameter("always_hold_control").value
         for param in params:
             if param.name == "behavior_control_level":
                 try:
@@ -809,18 +922,19 @@ class VectorRos2Driver(Node):
                     return SetParametersResult(successful=False, reason=str(exc))
             if param.name == "hold_control_during_cmd_vel":
                 hold_cmd_vel = bool(param.value)
+            if param.name == "always_hold_control":
+                always_hold = bool(param.value)
 
         self._behavior_control_level = behavior_level
+        self._always_hold_control = always_hold
         if self._robot is not None:
             self._robot.conn._behavior_control_level = behavior_level
-            if behavior_level is None:
-                self._release_control(force=True)
-            if not hold_cmd_vel and self._control_held_by_cmd_vel:
-                self._release_control()
+            self._control_executor.submit(self._apply_control_policy)
         level_label = "none" if behavior_level is None else behavior_level.name
         self.get_logger().info(
             f"Updated behavior_control_level={level_label} "
-            f"hold_control_during_cmd_vel={hold_cmd_vel}"
+            f"hold_control_during_cmd_vel={hold_cmd_vel} "
+            f"always_hold_control={always_hold}"
         )
         return SetParametersResult(successful=True)
 
