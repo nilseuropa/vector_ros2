@@ -10,11 +10,11 @@ from geometry_msgs.msg import PoseStamped, Twist
 from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import BatteryState, Image, Imu, JointState, Range
-from std_msgs.msg import Bool, Float32, String
+from std_msgs.msg import Bool, Float32
 from std_srvs.srv import Trigger
 from tf2_ros import TransformBroadcaster
 
-from vector_ros2.srv import PlayAnimationTrigger
+from vector_ros2.srv import PlayAnimationTrigger, SayText
 try:
     import anki_vector
     from anki_vector import util
@@ -103,7 +103,6 @@ class VectorRos2Driver(Node):
         self.create_subscription(Twist, "cmd_vel", self._on_cmd_vel, 10)
         self.create_subscription(Float32, "head_angle_cmd", self._on_head_angle, 10)
         self.create_subscription(Float32, "lift_height_cmd", self._on_lift_height, 10)
-        self.create_subscription(String, "say_text", self._on_say_text, 10)
 
     def _connect_robot(self):
         serial = self.get_parameter("serial").get_parameter_value().string_value.strip()
@@ -151,6 +150,7 @@ class VectorRos2Driver(Node):
             ),
             self.create_service(Trigger, "fetch_cube", self._srv_fetch_cube),
             self.create_service(Trigger, "go_home", self._srv_go_home),
+            self.create_service(SayText, "say_text", self._srv_say_text),
             self.create_service(
                 PlayAnimationTrigger, "play_animation", self._srv_play_animation_trigger
             ),
@@ -607,16 +607,26 @@ class VectorRos2Driver(Node):
         except Exception:
             pass
 
-    def _on_say_text(self, msg: String):
+    def _srv_say_text(self, request, _context):
+        response = SayText.Response()
         if self._robot is None:
-            return
-        text = msg.data.strip()
+            response.success = False
+            response.message = "say_text: robot not connected"
+            return response
+        text = request.text.strip()
         if not text:
-            return
+            response.success = False
+            response.message = "say_text: empty text"
+            return response
         try:
             self._sdk_call(self._robot.behavior.say_text, text)
-        except Exception:
-            pass
+        except Exception as exc:
+            response.success = False
+            response.message = f"say_text: {exc}"
+            return response
+        response.success = True
+        response.message = "say_text: ok"
+        return response
 
     def destroy_node(self):
         try:

@@ -22,7 +22,6 @@ Subscribes:
 - `cmd_vel` (geometry_msgs/Twist)
 - `head_angle_cmd` (std_msgs/Float32)
 - `lift_height_cmd` (std_msgs/Float32)
-- `say_text` (std_msgs/String)
 
 Services:
 - `start_exploration` (std_srvs/Trigger)
@@ -30,6 +29,7 @@ Services:
 - `go_home` (std_srvs/Trigger)
 - `drive_off_charger` (std_srvs/Trigger)
 - `play_animation` (vector_ros2/srv/PlayAnimationTrigger)
+- `say_text` (vector_ros2/srv/SayText)
 
 ## Setup
 
